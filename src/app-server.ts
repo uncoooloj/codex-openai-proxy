@@ -316,7 +316,13 @@ export class CodexAppServer implements AppServerLike {
 
     const { instructions, prompt } = translateConversation(request);
     const thread = await this.startThread(request.model, instructions, handlers.signal);
-    const turnId = await this.startTurn(thread.id, prompt, handlers.signal);
+    const turnId = await this.startTurn(
+      thread.id,
+      prompt,
+      request.response_format?.json_schema.schema,
+      request.serviceTier,
+      handlers.signal,
+    );
     const identity = { threadId: thread.id, turnId };
     const interrupt = () => this.interruptTurn(identity);
 
@@ -489,6 +495,8 @@ export class CodexAppServer implements AppServerLike {
   private async startTurn(
     threadId: string,
     prompt: string,
+    outputSchema: Record<string, unknown> | undefined,
+    serviceTier: string | undefined,
     signal: AbortSignal,
   ): Promise<string> {
     const result = await this.transport!.request(
@@ -497,6 +505,8 @@ export class CodexAppServer implements AppServerLike {
         threadId,
         input: [{ type: 'text', text: prompt, text_elements: [] }],
         environments: [],
+        ...(outputSchema ? { outputSchema } : {}),
+        ...(serviceTier ? { serviceTier } : {}),
       },
       signal,
     ) as { turn: { id: string } };
