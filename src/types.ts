@@ -1,4 +1,4 @@
-export type ChatRole = 'system' | 'developer' | 'user' | 'assistant';
+import type { ChatRole } from './constants.js';
 
 export interface ChatMessage {
   role: ChatRole;
@@ -29,14 +29,29 @@ export interface ProxyConfig {
   maxConcurrency: number;
 }
 
+export interface ModelInfo {
+  id: string;
+  ownedBy?: string;
+}
+
+export interface CompletionResult {
+  text: string;
+  model: string;
+}
+
+export interface CompletionHandlers {
+  onDelta?: (delta: string) => void;
+  signal: AbortSignal;
+}
+
 export interface AppServerLike {
   initialize(): Promise<void>;
   ready(): boolean;
-  listModels(signal?: AbortSignal): Promise<Array<{ id: string; ownedBy?: string }>>;
+  listModels(signal?: AbortSignal): Promise<ModelInfo[]>;
   complete(
     request: ChatCompletionRequest,
-    handlers: { onDelta?: (delta: string) => void; signal: AbortSignal },
-  ): Promise<{ text: string; model: string }>;
+    handlers: CompletionHandlers,
+  ): Promise<CompletionResult>;
   close(): Promise<void>;
 }
 

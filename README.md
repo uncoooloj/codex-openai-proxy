@@ -101,6 +101,17 @@ npm run typecheck
 npm test
 ```
 
+### Code map
+
+| File | Responsibility |
+|---|---|
+| `src/constants.ts` | Closed protocol and configuration value sets |
+| `src/config.ts` | CLI arguments, environment precedence, and safe defaults |
+| `src/app-server.ts` | Codex process lifecycle, JSON-RPC transport, and turn isolation |
+| `src/server.ts` | HTTP routing, OpenAI response translation, and concurrency limits |
+| `src/cli.ts` | Foreground process startup, status, and graceful shutdown |
+| `src/types.ts` | Public interfaces shared across those boundaries |
+
 The contract suite uses the official `openai` JavaScript client against an in-process fake Codex backend. Release verification additionally requires a real installed-Codex smoke test.
 
 See [Prior art](docs/prior-art.md) for related projects, lessons adopted, and why this implementation remains deliberately narrower.

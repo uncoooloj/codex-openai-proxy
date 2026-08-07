@@ -1,3 +1,4 @@
+import { LogLevel } from './constants.js';
 import type { Logger } from './types.js';
 
 const SECRET_KEYS = /token|authorization|api[-_]?key|credential|password|secret|body/i;
@@ -13,12 +14,12 @@ function safeFields(fields: Record<string, unknown> | undefined): Record<string,
 
 export const logger: Logger = {
   info(event, fields) {
-    console.error(JSON.stringify({ level: 'info', event, ...safeFields(fields) }));
+    console.error(JSON.stringify({ level: LogLevel.Info, event, ...safeFields(fields) }));
   },
   warn(event, fields) {
-    console.error(JSON.stringify({ level: 'warn', event, ...safeFields(fields) }));
+    console.error(JSON.stringify({ level: LogLevel.Warn, event, ...safeFields(fields) }));
   },
   error(event, fields) {
-    console.error(JSON.stringify({ level: 'error', event, ...safeFields(fields) }));
+    console.error(JSON.stringify({ level: LogLevel.Error, event, ...safeFields(fields) }));
   },
 };
