@@ -1,0 +1,30 @@
+{
+  "name": "@uncoooloj/codex-openai-proxy",
+  "version": "0.1.0",
+  "description": "Unofficial local OpenAI-compatible HTTP adapter for the Codex app-server",
+  "license": "MIT",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "bin": { "codex-openai-proxy": "dist/cli.js" },
+  "exports": {
+    ".": "./dist/index.js",
+    "./server": "./dist/server.js",
+    "./app-server": "./dist/app-server.js",
+    "./config": "./dist/config.js"
+  },
+  "files": ["dist", "README.md", "LICENSE", "SECURITY.md", "docs"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build",
+    "start": "node dist/cli.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test test/*.test.js",
+    "lint": "npm run typecheck"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "openai": "^7.4.0",
+    "typescript": "^5.6.0"
+  }
+}
