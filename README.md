@@ -66,14 +66,42 @@ The process runs in the foreground and handles `SIGINT`/`SIGTERM`. A background 
 | `GET /readyz` | Supported | app-server initialized and model discovery succeeded |
 | `GET /v1/models` | Supported | current Codex model list; bearer token required |
 | `POST /v1/chat/completions` | Supported, text only | one ephemeral Codex thread per request; `n=1` |
+| Chat Completions JSON Schema | Supported | `response_format.type="json_schema"` with `strict: true`; schema is passed to Codex `turn/start.outputSchema` |
+| `serviceTier` | `flex` only | Supermemory's camel-case field is passed to Codex `turn/start.serviceTier` |
 | Chat Completions SSE | Experimental | text deltas, terminal chunk, `[DONE]`, disconnect interruption |
 | `/v1/responses` | Not supported | agent items do not map faithfully enough yet |
 | Tools/functions | Not supported | rejected; no tool-call emulation |
 | Images/audio | Not supported | rejected |
-| Structured outputs | Not supported | rejected rather than approximated |
+| JSON object mode | Not supported | Codex rejects a generic object schema; prompt-only emulation would not be faithful |
 | Sampling controls and usage | Not supported | Codex does not expose faithful equivalents or authoritative OpenAI token accounting here |
 
 This is semantic compatibility for a narrow integration surface, not a drop-in implementation of the full OpenAI API.
+
+Strict JSON Schema requests use the standard Chat Completions shape:
+
+```js
+const result = await client.chat.completions.create({
+  model: "gpt-5.6-sol",
+  messages: [{ role: "user", content: "Extract memories." }],
+  response_format: {
+    type: "json_schema",
+    json_schema: {
+      name: "memory_result",
+      strict: true,
+      schema: {
+        type: "object",
+        properties: { memories: { type: "array", items: { type: "string" } } },
+        required: ["memories"],
+        additionalProperties: false,
+      },
+    },
+  },
+});
+```
+
+The returned `message.content` is still a JSON string, matching Chat Completions. The adapter requires `strict: true`, validates the wrapper, forwards only `json_schema.schema` as the current turn's Codex output schema, and does not expose a tool surface. Omitted or false strictness is rejected because Codex would still enforce `outputSchema`.
+
+Supermemory server-v0.0.6 currently falls back to `{ type: "json_object" }` and sends `serviceTier: "flex"` even for `gpt-5.4`. The adapter passes the tier to the documented Codex turn parameter, but rejects JSON object mode because Codex rejects the only honest generic-object schema. Other tier values are also rejected rather than ignored. Supermemory additionally sends a separate tools request during memory generation; that request remains rejected by design. As a result, this release does not yet make Supermemory's full memory-generation workflow compatible.
 
 ## Security model
 
@@ -83,6 +111,7 @@ This is semantic compatibility for a narrow integration surface, not a drop-in i
 - Each request gets an ephemeral Codex thread in a mode-0700 empty temporary directory, with experimental `environments: []` disabling the execution environment at both thread and turn scope.
 - Static user config, hooks, and memories are excluded by the private `CODEX_HOME`. Shell, apps, web search, remote plugins, and multi-agent features are disabled; the sandbox is read-only and approvals are `never`.
 - Any observed tool item or server approval/tool request fails the request. Request bodies and bearer tokens are excluded from structured request logs; a generated adapter token is printed once to the local operator at startup.
+- Request-shape diagnostics contain only allowlisted wrapper field names, counts of unknown fields, normalized schema/tier categories, and categorical tool count/type/choice metadata. Prompt text, unknown key names, tool or schema names, schema property names, descriptions, and arbitrary values are not logged.
 - Body size, timeout, and concurrency are bounded. Excess concurrency returns `429` instead of silently queueing.
 
 Codex app-server remains an experimental protocol. A future Codex version may change behavior. Treat a version upgrade as a security-sensitive change and rerun the real hostile-prompt test. See [SECURITY.md](SECURITY.md) and [ADR 0001](docs/adr/0001-architecture.md).
@@ -114,7 +143,7 @@ npm test
 
 The contract suite uses the official `openai` JavaScript client against an in-process fake Codex backend. Release verification additionally requires a real installed-Codex smoke test.
 
-See [Prior art](docs/prior-art.md) for related projects, lessons adopted, and why this implementation remains deliberately narrower.
+See [Prior art](docs/prior-art.md) for related projects and [ADR 0002](docs/adr/0002-chat-completions-json-schema.md) for the evidence behind structured-output support.
 
 ## License
 

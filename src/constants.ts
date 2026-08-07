@@ -104,6 +104,25 @@ export enum OpenAiFinishReason {
   Stop = 'stop',
 }
 
+export enum ChatResponseFormatType {
+  JsonObject = 'json_object',
+  JsonSchema = 'json_schema',
+}
+
+export enum ServiceTier {
+  Flex = 'flex',
+}
+
+export enum JsonSchemaType {
+  Array = 'array',
+  Boolean = 'boolean',
+  Integer = 'integer',
+  Null = 'null',
+  Number = 'number',
+  Object = 'object',
+  String = 'string',
+}
+
 export enum OpenAiErrorType {
   InvalidRequest = 'invalid_request_error',
   Authentication = 'authentication_error',

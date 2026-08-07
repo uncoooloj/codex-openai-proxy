@@ -9,7 +9,7 @@ Codex app-server is a JSON-RPC agent-control protocol, not an OpenAI HTTP infere
 
 ## Decision
 
-Ship a foreground TypeScript CLI which owns one long-lived private `codex app-server --listen stdio://` child and exposes a loopback-only HTTP server. Create one ephemeral Codex thread per Chat Completions request. Implement model listing, text Chat Completions, and evidence-backed SSE translation. Do not implement Responses API or tool/structured-output compatibility until it can be faithful.
+Ship a foreground TypeScript CLI which owns one long-lived private `codex app-server --listen stdio://` child and exposes a loopback-only HTTP server. Create one ephemeral Codex thread per Chat Completions request. Implement model listing, text Chat Completions, and evidence-backed SSE translation. Do not implement Responses API or tool compatibility until it can be faithful. Structured-output support was reconsidered after concrete protocol and consumer evidence; see ADR 0002.
 
 ### Daemon, foreground CLI, or library
 
@@ -37,7 +37,7 @@ Plain model callers cannot answer Codex approval prompts safely. The private `CO
 
 ### API scope and translation
 
-Chat Completions is the only generative endpoint. System/developer messages become Codex developer instructions; user/assistant history is serialized with explicit role markers because app-server cannot inject historical assistant messages. This is an approximation and is documented. `/v1/responses` is omitted because Codex reasoning, commands, approvals, file changes, and agent items cannot be represented faithfully. Sampling controls, usage, multimodal content, tools, and structured output are rejected rather than ignored.
+Chat Completions is the only generative endpoint. System/developer messages become Codex developer instructions; user/assistant history is serialized with explicit role markers because app-server cannot inject historical assistant messages. This is an approximation and is documented. `/v1/responses` is omitted because Codex reasoning, commands, approvals, file changes, and agent items cannot be represented faithfully. Sampling controls, usage, multimodal content, and tools are rejected rather than ignored. Chat Completions JSON Schema is supported only through the evidence-backed translation in ADR 0002.
 
 ### Streaming
 

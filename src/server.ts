@@ -7,18 +7,22 @@ import {
 } from 'node:http';
 import {
   ChatRole,
+  ChatResponseFormatType,
   HttpMethod,
   HttpRoute,
+  JsonSchemaType,
   OpenAiErrorCode,
   OpenAiErrorType,
   OpenAiFinishReason,
   OpenAiObjectType,
+  ServiceTier,
 } from './constants.js';
 import type {
   AppServerLike,
   ChatCompletionRequest,
   ChatMessage,
   CompletionResult,
+  JsonSchemaResponseFormat,
   Logger,
 } from './types.js';
 
@@ -26,6 +30,7 @@ const API_PREFIX = '/v1/';
 const BEARER_PREFIX = 'Bearer ';
 const CHAT_COMPLETION_ID_PREFIX = 'chatcmpl-';
 const SSE_DONE = 'data: [DONE]\n\n';
+const JSON_SCHEMA_NAME = /^[A-Za-z0-9_-]{1,64}$/;
 
 const SUPPORTED_REQUEST_FIELDS = new Set([
   'model',
@@ -33,7 +38,30 @@ const SUPPORTED_REQUEST_FIELDS = new Set([
   'stream',
   'n',
   'user',
+  'response_format',
+  'serviceTier',
 ]);
+
+const SUPPORTED_RESPONSE_FORMAT_FIELDS = new Set([
+  'type',
+  'json_schema',
+]);
+
+const SUPPORTED_JSON_SCHEMA_FIELDS = new Set([
+  'name',
+  'description',
+  'strict',
+  'schema',
+]);
+
+const DIAGNOSTIC_REQUEST_FIELDS = new Set([
+  ...SUPPORTED_REQUEST_FIELDS,
+  'max_tokens',
+  'tool_choice',
+  'tools',
+]);
+
+const JSON_SCHEMA_TYPES = new Set<string>(Object.values(JsonSchemaType));
 
 const SUPPORTED_CHAT_ROLES = new Set<string>(Object.values(ChatRole));
 
@@ -191,9 +219,9 @@ async function handleChatCompletion(
   backend: AppServerLike,
   options: ServerOptions,
 ): Promise<void> {
-  const body = validateChatCompletionRequest(
-    await readJsonBody(request, options.bodyLimit),
-  );
+  const rawBody = await readJsonBody(request, options.bodyLimit);
+  logRequestShape(options.logger, rawBody);
+  const body = validateChatCompletionRequest(rawBody);
   const controller = new AbortController();
   let requestFinished = false;
 
@@ -373,6 +401,9 @@ function validateChatCompletionRequest(raw: unknown): ChatCompletionRequest {
   if (body.n !== undefined && body.n !== 1) {
     throw invalidRequest('Only n=1 is supported.');
   }
+  if (body.serviceTier !== undefined && body.serviceTier !== ServiceTier.Flex) {
+    throw invalidRequest('Only serviceTier="flex" is supported.');
+  }
 
   for (const message of body.messages as ChatMessage[]) {
     if (
@@ -383,7 +414,202 @@ function validateChatCompletionRequest(raw: unknown): ChatCompletionRequest {
     }
   }
 
+  if (body.response_format !== undefined) {
+    body.response_format = validateResponseFormat(body.response_format);
+  }
+
   return body;
+}
+
+function validateResponseFormat(raw: unknown): JsonSchemaResponseFormat {
+  if (!isPlainObject(raw)) {
+    throw invalidRequest('response_format must be an object.');
+  }
+
+  rejectUnsupportedFields(raw, SUPPORTED_RESPONSE_FORMAT_FIELDS, 'response_format');
+  if (raw.type !== ChatResponseFormatType.JsonSchema) {
+    throw invalidRequest(
+      'Only response_format.type="json_schema" is supported.',
+    );
+  }
+  if (!isPlainObject(raw.json_schema)) {
+    throw invalidRequest('response_format.json_schema must be an object.');
+  }
+
+  const jsonSchema = raw.json_schema;
+  rejectUnsupportedFields(
+    jsonSchema,
+    SUPPORTED_JSON_SCHEMA_FIELDS,
+    'response_format.json_schema',
+  );
+
+  if (
+    typeof jsonSchema.name !== 'string'
+    || !JSON_SCHEMA_NAME.test(jsonSchema.name)
+  ) {
+    throw invalidRequest(
+      'response_format.json_schema.name must be 1-64 letters, numbers, underscores, or dashes.',
+    );
+  }
+  if (
+    jsonSchema.description !== undefined
+    && typeof jsonSchema.description !== 'string'
+  ) {
+    throw invalidRequest('response_format.json_schema.description must be a string.');
+  }
+  if (jsonSchema.strict !== true) {
+    throw invalidRequest('response_format.json_schema.strict must be true.');
+  }
+  if (!isPlainObject(jsonSchema.schema)) {
+    throw invalidRequest('response_format.json_schema.schema must be an object.');
+  }
+
+  return raw as unknown as JsonSchemaResponseFormat;
+}
+
+function rejectUnsupportedFields(
+  value: Record<string, unknown>,
+  supportedFields: ReadonlySet<string>,
+  path: string,
+): void {
+  for (const field of Object.keys(value)) {
+    if (!supportedFields.has(field)) {
+      throw invalidRequest(`${path}.${field} is not supported.`);
+    }
+  }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function logRequestShape(
+  logger: Logger,
+  raw: unknown,
+): void {
+  if (!isPlainObject(raw)) return;
+
+  const allRequestFields = Object.keys(raw);
+  const hasUnsupportedField = allRequestFields.some(
+    (field) => !SUPPORTED_REQUEST_FIELDS.has(field),
+  );
+  if (!('response_format' in raw) && !hasUnsupportedField) return;
+
+  const responseFormat = isPlainObject(raw.response_format)
+    ? raw.response_format
+    : undefined;
+  const jsonSchema = responseFormat && isPlainObject(responseFormat.json_schema)
+    ? responseFormat.json_schema
+    : undefined;
+  const schema = jsonSchema && isPlainObject(jsonSchema.schema)
+    ? jsonSchema.schema
+    : undefined;
+  const properties = schema && isPlainObject(schema.properties)
+    ? Object.keys(schema.properties).length
+    : 0;
+  const required = schema && Array.isArray(schema.required)
+    ? schema.required.length
+    : 0;
+
+  logger.info('chat_completion_request_shape', {
+    requestFields: recognizedFields(raw, DIAGNOSTIC_REQUEST_FIELDS),
+    unsupportedRequestFieldCount: countUnsupportedFields(
+      raw,
+      DIAGNOSTIC_REQUEST_FIELDS,
+    ),
+    responseFormatFields: recognizedFields(
+      responseFormat,
+      SUPPORTED_RESPONSE_FORMAT_FIELDS,
+    ),
+    unsupportedResponseFormatFieldCount: countUnsupportedFields(
+      responseFormat,
+      SUPPORTED_RESPONSE_FORMAT_FIELDS,
+    ),
+    jsonSchemaFields: recognizedFields(
+      jsonSchema,
+      SUPPORTED_JSON_SCHEMA_FIELDS,
+    ),
+    unsupportedJsonSchemaFieldCount: countUnsupportedFields(
+      jsonSchema,
+      SUPPORTED_JSON_SCHEMA_FIELDS,
+    ),
+    responseFormatType: responseFormat?.type === ChatResponseFormatType.JsonSchema
+      ? ChatResponseFormatType.JsonSchema
+      : responseFormat?.type === ChatResponseFormatType.JsonObject
+        ? ChatResponseFormatType.JsonObject
+        : 'other',
+    ...('serviceTier' in raw
+      ? { serviceTier: normalizedServiceTier(raw.serviceTier) }
+      : {}),
+    ...('tools' in raw ? toolShape(raw.tools, raw.tool_choice) : {}),
+    strict: jsonSchema?.strict === true,
+    schemaType: normalizedSchemaType(schema?.type),
+    schemaPropertyCount: properties,
+    schemaRequiredCount: required,
+  });
+}
+
+function recognizedFields(
+  value: Record<string, unknown> | undefined,
+  recognized: ReadonlySet<string>,
+): string[] {
+  if (!value) return [];
+  return Object.keys(value).filter((field) => recognized.has(field)).sort();
+}
+
+function countUnsupportedFields(
+  value: Record<string, unknown> | undefined,
+  recognized: ReadonlySet<string>,
+): number {
+  if (!value) return 0;
+  return Object.keys(value).filter((field) => !recognized.has(field)).length;
+}
+
+function normalizedSchemaType(value: unknown): string {
+  return typeof value === 'string' && JSON_SCHEMA_TYPES.has(value)
+    ? value
+    : value === undefined
+      ? 'unspecified'
+      : 'other';
+}
+
+function toolShape(
+  tools: unknown,
+  toolChoice: unknown,
+): Record<string, unknown> {
+  const toolList = Array.isArray(tools) ? tools : [];
+  const functionOnly = toolList.length > 0 && toolList.every((tool) => (
+    isPlainObject(tool) && tool.type === 'function'
+  ));
+
+  return {
+    toolCount: toolList.length,
+    toolTypeCategory: functionOnly ? 'function_only' : 'other',
+    toolChoiceCategory: normalizedToolChoice(toolChoice),
+  };
+}
+
+function normalizedToolChoice(value: unknown): string {
+  if (value === 'auto' || value === 'none' || value === 'required') {
+    return value;
+  }
+  if (isPlainObject(value) && value.type === 'function') {
+    return 'specific_function';
+  }
+  return typeof value;
+}
+
+function normalizedServiceTier(value: unknown): string {
+  if (value === null) return 'null';
+  if (
+    value === 'auto'
+    || value === 'default'
+    || value === 'flex'
+    || value === 'priority'
+  ) {
+    return value;
+  }
+  return typeof value;
 }
 
 async function readJsonBody(
