@@ -9,10 +9,10 @@ This project is not affiliated with, endorsed by, or supported by OpenAI. It is 
 Requirements: Node.js 20+, `codex-cli 0.146.0`, and a working `codex` login. The exact version gate is intentional because app-server is experimental; each new Codex version needs regenerated protocol evidence and runtime security tests before support is widened.
 
 ```bash
-npx github:uncoooloj/codex-openai-proxy#feat/openai-compatible-mvp
+npx github:uncoooloj/codex-openai-proxy#v0.0.1
 ```
 
-That command installs the current pull-request branch directly from GitHub. After the scoped package is published, the shorter command will be `npx @uncoooloj/codex-openai-proxy`.
+That command installs the versioned GitHub release tag. The scoped npm package is not currently published.
 
 On startup the proxy prints shell exports containing a freshly generated local adapter token:
 

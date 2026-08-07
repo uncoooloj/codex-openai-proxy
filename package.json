@@ -1,6 +1,6 @@
 {
   "name": "@uncoooloj/codex-openai-proxy",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "Unofficial local OpenAI-compatible HTTP adapter for the Codex app-server",
   "license": "MIT",
   "type": "module",

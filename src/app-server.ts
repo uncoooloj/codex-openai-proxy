@@ -34,6 +34,7 @@ const SHUTDOWN_GRACE_PERIOD_MS = 2_000;
 const TEMPORARY_CWD_PREFIX = 'codex-openai-proxy-';
 const TEMPORARY_HOME_PREFIX = 'codex-openai-proxy-home-';
 const SERVICE_NAME = 'codex-openai-proxy';
+const SERVICE_VERSION = '0.0.1';
 
 const BASE_INSTRUCTIONS = [
   'Act only as a text-generation assistant.',
@@ -428,7 +429,7 @@ export class CodexAppServer implements AppServerLike {
         clientInfo: {
           name: SERVICE_NAME,
           title: 'Codex OpenAI Proxy',
-          version: '0.1.0',
+          version: SERVICE_VERSION,
         },
         capabilities: {
           experimentalApi: true,
