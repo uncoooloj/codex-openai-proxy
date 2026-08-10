@@ -1,8 +1,22 @@
-import type { ChatRole } from './constants.js';
+import type {
+  ChatResponseFormatType,
+  ChatRole,
+  ServiceTier,
+} from './constants.js';
 
 export interface ChatMessage {
   role: ChatRole;
   content: string;
+}
+
+export interface JsonSchemaResponseFormat {
+  type: ChatResponseFormatType.JsonSchema;
+  json_schema: {
+    name: string;
+    description?: string;
+    strict: true;
+    schema: Record<string, unknown>;
+  };
 }
 
 export interface ChatCompletionRequest {
@@ -13,7 +27,8 @@ export interface ChatCompletionRequest {
   tools?: unknown;
   tool_choice?: unknown;
   functions?: unknown;
-  response_format?: unknown;
+  response_format?: JsonSchemaResponseFormat;
+  serviceTier?: ServiceTier;
   logprobs?: unknown;
   [key: string]: unknown;
 }
