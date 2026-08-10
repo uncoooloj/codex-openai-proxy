@@ -52,6 +52,21 @@ class FakeBackend {
         await this.waitUntilAbortedOrReleased(signal);
       }
 
+      if (request.tools?.length) {
+        return {
+          text: '',
+          model: request.model,
+          toolCalls: [{
+            id: 'call-test-1',
+            type: 'function',
+            function: {
+              name: request.tools[0].function.name,
+              arguments: JSON.stringify({ memory: 'amber' }),
+            },
+          }],
+        };
+      }
+
       const text = request.response_format
         ? JSON.stringify({ memoriesToAddOrUpdate: [] })
         : 'hello world';
@@ -131,6 +146,13 @@ class FakeTransport {
     });
   }
 
+  respondResult(id, result) {
+    this.calls.push({
+      method: 'respondResult',
+      params: { id, result },
+    });
+  }
+
   onNotification(handler) {
     this.notificationHandlers.push(handler);
     return () => {
@@ -146,6 +168,12 @@ class FakeTransport {
 
   emit(message) {
     for (const handler of this.notificationHandlers) {
+      handler(message);
+    }
+  }
+
+  requestFromServer(message) {
+    for (const handler of this.serverRequestHandlers) {
       handler(message);
     }
   }
@@ -224,6 +252,22 @@ function structuredResponseFormat() {
   };
 }
 
+function memoryTool() {
+  return {
+    type: 'function',
+    function: {
+      name: 'add_memory',
+      description: 'Add a memory.',
+      parameters: {
+        type: 'object',
+        properties: { memory: { type: 'string' } },
+        required: ['memory'],
+        additionalProperties: false,
+      },
+    },
+  };
+}
+
 test('official OpenAI client lists models and completes a chat', async (t) => {
   const fixture = await createFixture();
   t.after(() => fixture.server.close());
@@ -256,6 +300,78 @@ test('official OpenAI client receives a strict JSON Schema completion', async (t
   );
   assert.deepEqual(fixture.backend.lastRequest.response_format, responseFormat);
   assert.equal(fixture.backend.lastRequest.serviceTier, ServiceTier.Flex);
+});
+
+test('official OpenAI client receives validated JSON object mode', async (t) => {
+  const fixture = await createFixture();
+  t.after(() => fixture.server.close());
+
+  const result = await fixture.client.chat.completions.create(
+    chatBody('extract memories', {
+      response_format: { type: ChatResponseFormatType.JsonObject },
+      serviceTier: ServiceTier.Flex,
+    }),
+  );
+
+  assert.deepEqual(
+    JSON.parse(result.choices[0].message.content),
+    { memoriesToAddOrUpdate: [] },
+  );
+});
+
+test('official OpenAI client receives forwarded function tool calls', async (t) => {
+  const fixture = await createFixture();
+  t.after(() => fixture.server.close());
+
+  const result = await fixture.client.chat.completions.create(
+    chatBody('save the memory', {
+      max_tokens: 1000,
+      tools: [memoryTool()],
+      tool_choice: 'auto',
+    }),
+  );
+
+  assert.equal(result.choices[0].finish_reason, 'tool_calls');
+  assert.equal(result.choices[0].message.content, null);
+  assert.deepEqual(result.choices[0].message.tool_calls, [{
+    id: 'call-test-1',
+    type: 'function',
+    function: {
+      name: 'add_memory',
+      arguments: '{"memory":"amber"}',
+    },
+  }]);
+});
+
+test('accepts OpenAI assistant tool-call and tool-result history', async (t) => {
+  const fixture = await createFixture();
+  t.after(() => fixture.server.close());
+
+  const result = await fixture.client.chat.completions.create({
+    model: TEST_MODEL,
+    messages: [
+      { role: 'user', content: 'save amber' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call-previous',
+          type: 'function',
+          function: { name: 'add_memory', arguments: '{"memory":"amber"}' },
+        }],
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'call-previous',
+        content: '{"success":true}',
+      },
+    ],
+    tools: [memoryTool()],
+    tool_choice: 'auto',
+  });
+
+  assert.equal(result.choices[0].finish_reason, 'tool_calls');
+  assert.equal(fixture.backend.lastRequest.messages[2].role, 'tool');
 });
 
 test('passes only the requested JSON Schema to Codex turn/start', async () => {
@@ -310,6 +426,112 @@ test('passes only the requested JSON Schema to Codex turn/start', async () => {
   await backend.close();
 });
 
+test('maps OpenAI functions to Codex dynamic tools and forwards the call', async () => {
+  const transport = new FakeTransport();
+  const backend = new CodexAppServer({ transport, logger: silentLogger });
+  await backend.initialize();
+
+  const pending = backend.complete(
+    chatBody('save the memory', {
+      max_tokens: 1000,
+      tools: [memoryTool()],
+      tool_choice: 'auto',
+    }),
+    { signal: new AbortController().signal },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const threadCall = transport.calls.find(
+    (call) => call.method === CodexRpcMethod.StartThread,
+  );
+  assert.deepEqual(threadCall.params.dynamicTools, [{
+    type: 'function',
+    name: 'add_memory',
+    description: 'Add a memory.',
+    inputSchema: memoryTool().function.parameters,
+  }]);
+
+  transport.requestFromServer({
+    id: 88,
+    method: 'item/tool/call',
+    params: {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      callId: 'call-real-1',
+      tool: 'add_memory',
+      arguments: { memory: 'amber' },
+    },
+  });
+
+  assert.deepEqual((await pending).toolCalls, [{
+    id: 'call-real-1',
+    type: 'function',
+    function: {
+      name: 'add_memory',
+      arguments: '{"memory":"amber"}',
+    },
+  }]);
+  assert.ok(transportCalled(transport, 'respondResult'));
+  assert.ok(transportCalled(transport, CodexRpcMethod.InterruptTurn));
+  await backend.close();
+});
+
+test('translates tool-result history into the ephemeral Codex prompt', async () => {
+  const transport = new FakeTransport();
+  const backend = new CodexAppServer({ transport, logger: silentLogger });
+  await backend.initialize();
+
+  const pending = backend.complete({
+    model: TEST_MODEL,
+    messages: [
+      { role: 'user', content: 'save amber' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call-previous',
+          type: 'function',
+          function: { name: 'add_memory', arguments: '{"memory":"amber"}' },
+        }],
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'call-previous',
+        content: '{"success":true}',
+      },
+    ],
+    tools: [memoryTool()],
+    tool_choice: 'auto',
+  }, { signal: new AbortController().signal });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const turnCall = transport.calls.find(
+    (call) => call.method === CodexRpcMethod.StartTurn,
+  );
+  const prompt = turnCall.params.input[0].text;
+  assert.match(prompt, /<tool_calls>/);
+  assert.match(prompt, /<tool_result call_id="call-previous">/);
+
+  transport.emit({
+    method: CodexNotification.ItemCompleted,
+    params: {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      item: { type: 'agentMessage', text: 'done' },
+    },
+  });
+  transport.emit({
+    method: CodexNotification.TurnCompleted,
+    params: {
+      threadId: 'thread-1',
+      turn: { id: 'turn-1', status: CodexTurnStatus.Completed },
+    },
+  });
+
+  assert.equal((await pending).text, 'done');
+  await backend.close();
+});
+
 test('rejects unauthorized and unsupported requests', async (t) => {
   const fixture = await createFixture();
   t.after(() => fixture.server.close());
@@ -338,9 +560,12 @@ test('rejects unauthorized and unsupported requests', async (t) => {
 
   await assert.rejects(
     () => fixture.client.chat.completions.create(chatBody('hi', {
-      tools: [{ type: 'function', function: { name: 'unsafe' } }],
+      tools: [{
+        type: 'function',
+        function: { name: 'unsafe', parameters: 'not-a-schema' },
+      }],
     })),
-    /tools is not supported/,
+    /function\.parameters must be an object/,
   );
 
   await assert.rejects(
@@ -352,10 +577,18 @@ test('rejects unauthorized and unsupported requests', async (t) => {
 
   await assert.rejects(
     () => fixture.client.chat.completions.create(chatBody('hi', {
-      response_format: { type: ChatResponseFormatType.JsonObject },
+      tools: [memoryTool()],
+      tool_choice: 'required',
     })),
-    /Only response_format.type="json_schema" is supported/,
+    /tool_choice must be "auto" or "none"/,
   );
+
+  const streamedJson = await postChat(fixture.baseURL, 'hi', {
+    stream: true,
+    response_format: { type: ChatResponseFormatType.JsonObject },
+  });
+  assert.equal(streamedJson.status, 400);
+
 });
 
 test('rejects malformed JSON Schema response formats', async (t) => {
