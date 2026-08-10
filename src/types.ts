@@ -6,7 +6,9 @@ import type {
 
 export interface ChatMessage {
   role: ChatRole;
-  content: string;
+  content: string | null;
+  tool_calls?: CompletionToolCall[];
+  tool_call_id?: string;
 }
 
 export interface JsonSchemaResponseFormat {
@@ -19,15 +21,43 @@ export interface JsonSchemaResponseFormat {
   };
 }
 
+export interface JsonObjectResponseFormat {
+  type: ChatResponseFormatType.JsonObject;
+}
+
+export type ChatResponseFormat =
+  | JsonSchemaResponseFormat
+  | JsonObjectResponseFormat;
+
+export interface ChatFunctionTool {
+  type: 'function';
+  function: {
+    name: string;
+    description?: string;
+    parameters: Record<string, unknown>;
+    strict?: boolean;
+  };
+}
+
+export interface CompletionToolCall {
+  id: string;
+  type: 'function';
+  function: {
+    name: string;
+    arguments: string;
+  };
+}
+
 export interface ChatCompletionRequest {
   model: string;
   messages: ChatMessage[];
   stream?: boolean;
   n?: number;
-  tools?: unknown;
-  tool_choice?: unknown;
+  tools?: ChatFunctionTool[];
+  tool_choice?: 'auto' | 'none';
   functions?: unknown;
-  response_format?: JsonSchemaResponseFormat;
+  max_tokens?: number;
+  response_format?: ChatResponseFormat;
   serviceTier?: ServiceTier;
   logprobs?: unknown;
   [key: string]: unknown;
@@ -52,6 +82,7 @@ export interface ModelInfo {
 export interface CompletionResult {
   text: string;
   model: string;
+  toolCalls?: CompletionToolCall[];
 }
 
 export interface CompletionHandlers {
@@ -83,6 +114,7 @@ export interface JsonRpcTransport {
   request(method: string, params?: unknown, signal?: AbortSignal): Promise<unknown>;
   notify(method: string, params?: unknown): void;
   respondError(id: string | number, code: number, message: string): void;
+  respondResult(id: string | number, result: unknown): void;
   onNotification(handler: (message: JsonRpcMessage) => void): () => void;
   onServerRequest(handler: (message: JsonRpcMessage) => void): () => void;
   close(): Promise<void>;
