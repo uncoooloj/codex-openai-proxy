@@ -19,10 +19,11 @@ import {
 } from './constants.js';
 import type {
   AppServerLike,
+  ChatFunctionTool,
   ChatCompletionRequest,
   ChatMessage,
+  ChatResponseFormat,
   CompletionResult,
-  JsonSchemaResponseFormat,
   Logger,
 } from './types.js';
 
@@ -40,6 +41,9 @@ const SUPPORTED_REQUEST_FIELDS = new Set([
   'user',
   'response_format',
   'serviceTier',
+  'max_tokens',
+  'tool_choice',
+  'tools',
 ]);
 
 const SUPPORTED_RESPONSE_FORMAT_FIELDS = new Set([
@@ -276,6 +280,12 @@ async function sendCompletion(
   const result = await backend.complete(body, { signal });
   const created = currentUnixTime();
 
+  if (body.response_format?.type === ChatResponseFormatType.JsonObject) {
+    assertJsonObject(result.text);
+  }
+
+  const toolCalls = result.toolCalls;
+
   sendJson(response, 200, {
     id: createCompletionId(),
     object: OpenAiObjectType.ChatCompletion,
@@ -285,10 +295,13 @@ async function sendCompletion(
       index: 0,
       message: {
         role: ChatRole.Assistant,
-        content: result.text,
+        content: toolCalls ? null : result.text,
         refusal: null,
+        ...(toolCalls ? { tool_calls: toolCalls } : {}),
       },
-      finish_reason: OpenAiFinishReason.Stop,
+      finish_reason: toolCalls
+        ? OpenAiFinishReason.ToolCalls
+        : OpenAiFinishReason.Stop,
     }],
   });
 }
@@ -404,29 +417,133 @@ function validateChatCompletionRequest(raw: unknown): ChatCompletionRequest {
   if (body.serviceTier !== undefined && body.serviceTier !== ServiceTier.Flex) {
     throw invalidRequest('Only serviceTier="flex" is supported.');
   }
-
-  for (const message of body.messages as ChatMessage[]) {
-    if (
-      !SUPPORTED_CHAT_ROLES.has(message?.role)
-      || typeof message?.content !== 'string'
-    ) {
-      throw invalidRequest('Only text chat messages are supported.');
-    }
+  if (
+    body.max_tokens !== undefined
+    && (!Number.isInteger(body.max_tokens) || body.max_tokens < 1)
+  ) {
+    throw invalidRequest('max_tokens must be a positive integer.');
   }
+
+  body.messages = body.messages.map(validateChatMessage);
 
   if (body.response_format !== undefined) {
     body.response_format = validateResponseFormat(body.response_format);
+    if (
+      body.stream
+      && body.response_format.type === ChatResponseFormatType.JsonObject
+    ) {
+      throw invalidRequest('Streaming JSON object mode is not supported.');
+    }
+  }
+  if (body.tools !== undefined) {
+    body.tools = validateTools(body.tools);
+    if (body.stream) {
+      throw invalidRequest('Streaming tool calls are not supported.');
+    }
+  }
+  if (body.tool_choice !== undefined) {
+    if (!['auto', 'none'].includes(String(body.tool_choice))) {
+      throw invalidRequest('tool_choice must be "auto" or "none".');
+    }
+    if (body.tools === undefined) {
+      throw invalidRequest('tool_choice requires tools.');
+    }
   }
 
   return body;
 }
 
-function validateResponseFormat(raw: unknown): JsonSchemaResponseFormat {
+function validateChatMessage(message: unknown, index: number): ChatMessage {
+  if (!isPlainObject(message) || !SUPPORTED_CHAT_ROLES.has(String(message.role))) {
+    throw invalidRequest(`messages[${index}].role is not supported.`);
+  }
+
+  const role = message.role as ChatMessage['role'];
+  if (role === ChatRole.Tool) {
+    rejectUnsupportedFields(
+      message,
+      new Set(['role', 'content', 'tool_call_id']),
+      `messages[${index}]`,
+    );
+    if (typeof message.content !== 'string') {
+      throw invalidRequest(`messages[${index}].content must be a string.`);
+    }
+    if (typeof message.tool_call_id !== 'string' || !message.tool_call_id) {
+      throw invalidRequest(`messages[${index}].tool_call_id is required.`);
+    }
+    return message as unknown as ChatMessage;
+  }
+
+  if (role === ChatRole.Assistant) {
+    rejectUnsupportedFields(
+      message,
+      new Set(['role', 'content', 'tool_calls']),
+      `messages[${index}]`,
+    );
+    if (message.content !== null && typeof message.content !== 'string') {
+      throw invalidRequest(`messages[${index}].content must be a string or null.`);
+    }
+    if (message.tool_calls !== undefined) {
+      validateAssistantToolCalls(message.tool_calls, index);
+    }
+    if (message.content === null && message.tool_calls === undefined) {
+      throw invalidRequest(`messages[${index}] must contain content or tool_calls.`);
+    }
+    return message as unknown as ChatMessage;
+  }
+
+  rejectUnsupportedFields(
+    message,
+    new Set(['role', 'content']),
+    `messages[${index}]`,
+  );
+  if (typeof message.content !== 'string') {
+    throw invalidRequest(`messages[${index}].content must be a string.`);
+  }
+  return message as unknown as ChatMessage;
+}
+
+function validateAssistantToolCalls(raw: unknown, messageIndex: number): void {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw invalidRequest(`messages[${messageIndex}].tool_calls must be non-empty.`);
+  }
+  raw.forEach((call, callIndex) => {
+    const path = `messages[${messageIndex}].tool_calls[${callIndex}]`;
+    if (!isPlainObject(call) || call.type !== 'function') {
+      throw invalidRequest(`${path} must be a function call.`);
+    }
+    rejectUnsupportedFields(call, new Set(['id', 'type', 'function']), path);
+    if (typeof call.id !== 'string' || !call.id) {
+      throw invalidRequest(`${path}.id is required.`);
+    }
+    if (!isPlainObject(call.function)) {
+      throw invalidRequest(`${path}.function must be an object.`);
+    }
+    rejectUnsupportedFields(call.function, new Set(['name', 'arguments']), `${path}.function`);
+    if (
+      typeof call.function.name !== 'string'
+      || !JSON_SCHEMA_NAME.test(call.function.name)
+    ) {
+      throw invalidRequest(`${path}.function.name is invalid.`);
+    }
+    if (typeof call.function.arguments !== 'string') {
+      throw invalidRequest(`${path}.function.arguments must be a string.`);
+    }
+  });
+}
+
+function validateResponseFormat(raw: unknown): ChatResponseFormat {
   if (!isPlainObject(raw)) {
     throw invalidRequest('response_format must be an object.');
   }
 
   rejectUnsupportedFields(raw, SUPPORTED_RESPONSE_FORMAT_FIELDS, 'response_format');
+  if (raw.type === ChatResponseFormatType.JsonObject) {
+    if ('json_schema' in raw) {
+      throw invalidRequest('response_format.json_schema is not valid for json_object.');
+    }
+    return raw as unknown as ChatResponseFormat;
+  }
   if (raw.type !== ChatResponseFormatType.JsonSchema) {
     throw invalidRequest(
       'Only response_format.type="json_schema" is supported.',
@@ -464,7 +581,78 @@ function validateResponseFormat(raw: unknown): JsonSchemaResponseFormat {
     throw invalidRequest('response_format.json_schema.schema must be an object.');
   }
 
-  return raw as unknown as JsonSchemaResponseFormat;
+  return raw as unknown as ChatResponseFormat;
+}
+
+function validateTools(raw: unknown): ChatFunctionTool[] {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw invalidRequest('tools must be a non-empty array.');
+  }
+
+  const names = new Set<string>();
+  return raw.map((tool, index) => {
+    if (!isPlainObject(tool) || tool.type !== 'function') {
+      throw invalidRequest(`tools[${index}] must be a function tool.`);
+    }
+    rejectUnsupportedFields(tool, new Set(['type', 'function']), `tools[${index}]`);
+    if (!isPlainObject(tool.function)) {
+      throw invalidRequest(`tools[${index}].function must be an object.`);
+    }
+    rejectUnsupportedFields(
+      tool.function,
+      new Set(['name', 'description', 'parameters', 'strict']),
+      `tools[${index}].function`,
+    );
+
+    const name = tool.function.name;
+    if (typeof name !== 'string' || !JSON_SCHEMA_NAME.test(name)) {
+      throw invalidRequest(`tools[${index}].function.name is invalid.`);
+    }
+    if (names.has(name)) {
+      throw invalidRequest(`tools contains duplicate function name ${name}.`);
+    }
+    names.add(name);
+
+    if (
+      tool.function.description !== undefined
+      && typeof tool.function.description !== 'string'
+    ) {
+      throw invalidRequest(`tools[${index}].function.description must be a string.`);
+    }
+    if (!isPlainObject(tool.function.parameters)) {
+      throw invalidRequest(`tools[${index}].function.parameters must be an object.`);
+    }
+    if (
+      tool.function.strict !== undefined
+      && typeof tool.function.strict !== 'boolean'
+    ) {
+      throw invalidRequest(`tools[${index}].function.strict must be a boolean.`);
+    }
+
+    return tool as unknown as ChatFunctionTool;
+  });
+}
+
+function assertJsonObject(text: string): void {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new HttpError(
+      'Codex did not return a valid JSON object.',
+      502,
+      OpenAiErrorCode.CodexError,
+      OpenAiErrorType.Server,
+    );
+  }
+  if (!isPlainObject(parsed)) {
+    throw new HttpError(
+      'Codex did not return a JSON object.',
+      502,
+      OpenAiErrorCode.CodexError,
+      OpenAiErrorType.Server,
+    );
+  }
 }
 
 function rejectUnsupportedFields(
@@ -493,7 +681,11 @@ function logRequestShape(
   const hasUnsupportedField = allRequestFields.some(
     (field) => !SUPPORTED_REQUEST_FIELDS.has(field),
   );
-  if (!('response_format' in raw) && !hasUnsupportedField) return;
+  if (
+    !('response_format' in raw)
+    && !('tools' in raw)
+    && !hasUnsupportedField
+  ) return;
 
   const responseFormat = isPlainObject(raw.response_format)
     ? raw.response_format

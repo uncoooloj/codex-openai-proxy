@@ -5,7 +5,10 @@
 - Accept strict Chat Completions `response_format.type="json_schema"` requests.
 - Pass the requested schema to Codex as the current turn's `outputSchema`.
 - Pass Supermemory's evidenced `serviceTier: "flex"` field to Codex.
-- Keep JSON object mode, tools/functions, multimodal input, and the Responses API explicitly unsupported.
+- Add validated, non-streaming Chat Completions JSON object mode.
+- Translate function tools into Codex dynamic tools and forward calls without executing them.
+- Accept assistant tool-call and tool-result history for multi-turn tool workflows.
+- Keep legacy functions, required/specific tool choice, multimodal input, and the Responses API explicitly unsupported.
 - Log only non-content schema metadata for structured-output diagnostics.
 
 ## 0.0.1 - 2026-08-07

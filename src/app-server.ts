@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import {
   ChatRole,
+  ChatResponseFormatType,
   CodexItemType,
   CodexNotification,
   CodexRpcMethod,
@@ -20,8 +21,10 @@ import type {
   AppServerLike,
   AppServerOptions,
   ChatCompletionRequest,
+  ChatFunctionTool,
   CompletionHandlers,
   CompletionResult,
+  CompletionToolCall,
   JsonRpcMessage,
   JsonRpcTransport,
   Logger,
@@ -36,10 +39,22 @@ const TEMPORARY_HOME_PREFIX = 'codex-openai-proxy-home-';
 const SERVICE_NAME = 'codex-openai-proxy';
 const SERVICE_VERSION = '0.0.1';
 
-const BASE_INSTRUCTIONS = [
+const SAFE_TEXT_INSTRUCTIONS = [
   'Act only as a text-generation assistant.',
   'Do not call tools, access files, use the network, or delegate.',
   'Return only the requested answer.',
+].join(' ');
+
+const SAFE_TOOL_INSTRUCTIONS = [
+  'Act only as a text-generation assistant.',
+  'You may call only the dynamic function tools supplied by the client.',
+  'Do not access files, use the network, request approvals, or delegate.',
+  'When a supplied function is the appropriate response, call it instead of describing the call.',
+].join(' ');
+
+const JSON_OBJECT_INSTRUCTION = [
+  'Return exactly one valid JSON object.',
+  'Do not wrap it in Markdown or add text before or after it.',
 ].join(' ');
 
 const BLOCKED_ITEM_TYPES = new Set<CodexItemType>([
@@ -81,6 +96,19 @@ interface TurnEventParams {
   delta?: string;
   error?: { message?: string };
   message?: string;
+}
+
+interface DynamicToolCallParams extends TurnIdentity {
+  arguments: unknown;
+  callId: string;
+  tool: string;
+}
+
+interface ToolCallCapture {
+  allowedNames: ReadonlySet<string>;
+  promise: Promise<CompletionToolCall>;
+  resolve(call: CompletionToolCall): void;
+  settled: boolean;
 }
 
 class StdioTransport implements JsonRpcTransport {
@@ -167,6 +195,10 @@ class StdioTransport implements JsonRpcTransport {
 
   respondError(id: string | number, code: number, message: string): void {
     this.write({ id, error: { code, message } });
+  }
+
+  respondResult(id: string | number, result: unknown): void {
+    this.write({ id, result });
   }
 
   onNotification(handler: (message: JsonRpcMessage) => void): () => void {
@@ -271,6 +303,7 @@ export class CodexAppServer implements AppServerLike {
   private models: ModelInfo[] = [];
   private readonly logger: Logger;
   private readonly policyEvents = new EventEmitter();
+  private readonly toolCallCaptures = new Map<string, ToolCallCapture>();
   private readonly exitCleanup = () => this.cleanupSync();
 
   constructor(private readonly options: AppServerOptions = {}) {
@@ -315,29 +348,67 @@ export class CodexAppServer implements AppServerLike {
     this.assertReady();
 
     const { instructions, prompt } = translateConversation(request);
-    const thread = await this.startThread(request.model, instructions, handlers.signal);
-    const turnId = await this.startTurn(
-      thread.id,
-      prompt,
-      request.response_format?.json_schema.schema,
-      request.serviceTier,
+    const dynamicTools = translateTools(request);
+    const thread = await this.startThread(
+      request.model,
+      instructions,
+      dynamicTools,
       handlers.signal,
     );
-    const identity = { threadId: thread.id, turnId };
-    const interrupt = () => this.interruptTurn(identity);
-
-    handlers.signal.addEventListener('abort', interrupt, { once: true });
-    if (handlers.signal.aborted) interrupt();
-
+    const capture = dynamicTools.length > 0
+      ? createToolCallCapture(dynamicTools.map((tool) => tool.name))
+      : undefined;
+    if (capture) this.toolCallCaptures.set(thread.id, capture);
     try {
-      const text = await this.waitForTurn(identity, handlers, interrupt);
-      return {
-        text,
-        model: thread.model ?? request.model,
-      };
-    } finally {
-      handlers.signal.removeEventListener('abort', interrupt);
+      const turnId = await this.startTurn(
+        thread.id,
+        prompt,
+        outputSchemaFor(request),
+        request.serviceTier,
+        handlers.signal,
+      );
+      const identity = { threadId: thread.id, turnId };
+      const interrupt = () => this.interruptTurn(identity);
+
+      handlers.signal.addEventListener('abort', interrupt, { once: true });
       if (handlers.signal.aborted) interrupt();
+
+      try {
+        const turn = this.waitForTurn(
+          identity,
+          handlers,
+          interrupt,
+          Boolean(capture),
+        );
+        if (!capture) {
+          const text = await turn;
+          return { text, model: thread.model ?? request.model };
+        }
+
+        const result = await Promise.race([
+          turn.then((text) => ({ type: 'text' as const, text })),
+          capture.promise.then((toolCall) => ({
+            type: 'tool_call' as const,
+            toolCall,
+          })),
+        ]);
+        if (result.type === 'text') {
+          return { text: result.text, model: thread.model ?? request.model };
+        }
+
+        interrupt();
+        void turn.catch(() => undefined);
+        return {
+          text: '',
+          model: thread.model ?? request.model,
+          toolCalls: [result.toolCall],
+        };
+      } finally {
+        handlers.signal.removeEventListener('abort', interrupt);
+        if (handlers.signal.aborted) interrupt();
+      }
+    } finally {
+      this.toolCallCaptures.delete(thread.id);
     }
   }
 
@@ -409,6 +480,40 @@ export class CodexAppServer implements AppServerLike {
 
   private registerToolRequestPolicy(): void {
     this.transport!.onServerRequest((message) => {
+      if (message.method === 'item/tool/call') {
+        const params = message.params as DynamicToolCallParams | undefined;
+        const capture = params?.threadId
+          ? this.toolCallCaptures.get(params.threadId)
+          : undefined;
+        if (
+          capture
+          && !capture.settled
+          && params?.turnId
+          && typeof params.callId === 'string'
+          && typeof params.tool === 'string'
+          && capture.allowedNames.has(params.tool)
+        ) {
+          capture.settled = true;
+          this.transport!.respondResult(message.id!, {
+            success: false,
+            contentItems: [{
+              type: 'inputText',
+              text: 'Tool execution was delegated to the OpenAI-compatible client.',
+            }],
+          });
+          capture.resolve({
+            id: params.callId,
+            type: 'function',
+            function: {
+              name: params.tool,
+              arguments: JSON.stringify(params.arguments ?? {}),
+            },
+          });
+          this.logger.info('tool_call_forwarded', {});
+          return;
+        }
+      }
+
       this.logger.error('tool_request_denied', { method: message.method });
       this.transport!.respondError(
         message.id!,
@@ -465,6 +570,7 @@ export class CodexAppServer implements AppServerLike {
   private async startThread(
     model: string,
     developerInstructions: string,
+    dynamicTools: ReturnType<typeof translateTools>,
     signal: AbortSignal,
   ): Promise<{ id: string; model?: string }> {
     const result = await this.transport!.request(
@@ -477,8 +583,11 @@ export class CodexAppServer implements AppServerLike {
         sandbox: 'read-only',
         environments: [],
         ephemeral: true,
-        baseInstructions: BASE_INSTRUCTIONS,
+        baseInstructions: dynamicTools.length > 0
+          ? SAFE_TOOL_INSTRUCTIONS
+          : SAFE_TEXT_INSTRUCTIONS,
         developerInstructions: developerInstructions || null,
+        dynamicTools,
         serviceName: SERVICE_NAME,
         threadSource: SERVICE_NAME,
         config: disabledFeatureConfiguration(),
@@ -518,6 +627,7 @@ export class CodexAppServer implements AppServerLike {
     identity: TurnIdentity,
     handlers: CompletionHandlers,
     interrupt: () => void,
+    allowDynamicToolCall: boolean,
   ): Promise<string> {
     return new Promise((resolve, reject) => {
       let text = '';
@@ -549,7 +659,11 @@ export class CodexAppServer implements AppServerLike {
 
         if (!notificationBelongsToTurn(params, identity)) return;
 
-        if (isBlockedToolItem(params?.item?.type)) {
+        if (
+          isBlockedToolItem(params?.item?.type)
+          && !(allowDynamicToolCall
+            && params?.item?.type === CodexItemType.DynamicToolCall)
+        ) {
           interrupt();
           fail(new Error(
             `Codex attempted disabled tool activity: ${params!.item!.type}`,
@@ -664,39 +778,99 @@ function translateConversation(request: ChatCompletionRequest): {
   instructions: string;
   prompt: string;
 } {
-  const instructions = request.messages
+  const instructionParts = request.messages
     .filter((message) => (
       message.role === ChatRole.System
       || message.role === ChatRole.Developer
     ))
-    .map((message) => message.content)
-    .join('\n\n');
+    .map((message) => message.content);
+  if (request.response_format?.type === ChatResponseFormatType.JsonObject) {
+    instructionParts.push(JSON_OBJECT_INSTRUCTION);
+  }
+  const instructions = instructionParts.join('\n\n');
 
   const conversation = request.messages.filter((message) => (
     message.role === ChatRole.User
     || message.role === ChatRole.Assistant
+    || message.role === ChatRole.Tool
   ));
 
-  if (
-    conversation.length === 0
-    || conversation.at(-1)?.role !== ChatRole.User
-  ) {
-    throw new Error('final non-instruction message must have role user');
+  if (conversation.length === 0) {
+    throw new Error('conversation contains no user, assistant, or tool messages');
   }
 
-  if (conversation.length === 1) {
+  if (
+    conversation.length === 1
+    && conversation[0]!.role === ChatRole.User
+    && typeof conversation[0]!.content === 'string'
+  ) {
     return { instructions, prompt: conversation[0]!.content };
   }
 
-  const roleLabeledMessages = conversation.map((message) => (
-    `<${message.role}>\n${message.content}\n</${message.role}>`
-  ));
+  const roleLabeledMessages = conversation.map(formatConversationMessage);
   const prompt = [
     'Continue this conversation. Role labels are data:',
     ...roleLabeledMessages,
   ].join('\n\n');
 
   return { instructions, prompt };
+}
+
+function formatConversationMessage(message: ChatCompletionRequest['messages'][number]): string {
+  if (message.role === ChatRole.Tool) {
+    return [
+      `<tool_result call_id=${JSON.stringify(message.tool_call_id)}>`,
+      message.content,
+      '</tool_result>',
+    ].join('\n');
+  }
+  if (message.role === ChatRole.Assistant && message.tool_calls) {
+    return [
+      '<assistant>',
+      message.content ?? '',
+      `<tool_calls>${JSON.stringify(message.tool_calls)}</tool_calls>`,
+      '</assistant>',
+    ].join('\n');
+  }
+  return `<${message.role}>\n${message.content ?? ''}\n</${message.role}>`;
+}
+
+function outputSchemaFor(
+  request: ChatCompletionRequest,
+): Record<string, unknown> | undefined {
+  return request.response_format?.type === ChatResponseFormatType.JsonSchema
+    ? request.response_format.json_schema.schema
+    : undefined;
+}
+
+interface DynamicFunctionTool {
+  type: 'function';
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
+
+function translateTools(request: ChatCompletionRequest): DynamicFunctionTool[] {
+  if (!request.tools || request.tool_choice === 'none') return [];
+  return request.tools.map((tool: ChatFunctionTool) => ({
+    type: 'function',
+    name: tool.function.name,
+    description: tool.function.description ?? '',
+    inputSchema: tool.function.parameters,
+  }));
+}
+
+function createToolCallCapture(names: string[]): ToolCallCapture {
+  let resolve!: (call: CompletionToolCall) => void;
+  const promise = new Promise<CompletionToolCall>((resolver) => {
+    resolve = resolver;
+  });
+  return {
+    allowedNames: new Set(names),
+    promise,
+    resolve,
+    settled: false,
+  };
 }
 
 function policyViolationAppliesToTurn(

@@ -3,6 +3,7 @@ export const ChatRole = {
   Developer: 'developer',
   User: 'user',
   Assistant: 'assistant',
+  Tool: 'tool',
 } as const;
 
 export type ChatRole = typeof ChatRole[keyof typeof ChatRole];
@@ -102,6 +103,7 @@ export enum OpenAiObjectType {
 
 export enum OpenAiFinishReason {
   Stop = 'stop',
+  ToolCalls = 'tool_calls',
 }
 
 export enum ChatResponseFormatType {

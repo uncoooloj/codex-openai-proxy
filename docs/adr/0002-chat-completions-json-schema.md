@@ -1,6 +1,6 @@
 # ADR 0002: Chat Completions structured-output translation
 
-- Status: accepted
+- Status: superseded in part by ADR 0003
 - Date: 2026-08-07
 
 ## Context
