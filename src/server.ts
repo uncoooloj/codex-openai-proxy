@@ -183,6 +183,11 @@ async function handleRequest(
 
     throw routeNotFound();
   } catch (error) {
+    if (error instanceof HttpError && (error.status === 408 || error.status === 413)) {
+      // Do not keep a partial or oversized upload alive after releasing its slot.
+      response.setHeader('connection', 'close');
+      response.once('finish', () => request.destroy());
+    }
     handleRequestError(error, response, options.logger);
   }
 }
@@ -223,7 +228,7 @@ async function handleChatCompletion(
   backend: AppServerLike,
   options: ServerOptions,
 ): Promise<void> {
-  const rawBody = await readJsonBody(request, options.bodyLimit);
+  const rawBody = await readJsonBody(request, options.bodyLimit, options.timeoutMs);
   logRequestShape(options.logger, rawBody);
   const body = validateChatCompletionRequest(rawBody);
   const controller = new AbortController();
@@ -250,8 +255,10 @@ async function handleChatCompletion(
 
   request.once('aborted', disconnect);
   response.once('close', disconnect);
+  if (request.aborted || response.destroyed) disconnect();
 
   try {
+    controller.signal.throwIfAborted();
     if (body.stream) {
       await streamCompletion(response, backend, body, controller);
     } else {
@@ -280,7 +287,7 @@ async function sendCompletion(
   const result = await backend.complete(body, { signal });
   const created = currentUnixTime();
 
-  if (body.response_format?.type === ChatResponseFormatType.JsonObject) {
+  if (!result.toolCalls && body.response_format?.type === ChatResponseFormatType.JsonObject) {
     assertJsonObject(result.text);
   }
 
@@ -332,7 +339,7 @@ async function streamCompletion(
   const result = await backend.complete(body, {
     signal: controller.signal,
     onDelta: (content) => {
-      if (!streamWritable || controller.signal.aborted) return;
+      if (!content || !streamWritable || controller.signal.aborted) return;
 
       startStream();
       streamWritable = writeSse(response, {
@@ -362,6 +369,19 @@ async function streamCompletion(
   });
 
   startStream();
+  if (!assistantRoleSent && result.text) {
+    writeSse(response, {
+      id,
+      object: OpenAiObjectType.ChatCompletionChunk,
+      created,
+      model: result.model,
+      choices: [{
+        index: 0,
+        delta: { role: ChatRole.Assistant, content: result.text },
+        finish_reason: null,
+      }],
+    });
+  }
   writeFinalStreamChunk(response, id, created, result);
   response.end(SSE_DONE);
 }
@@ -807,29 +827,54 @@ function normalizedServiceTier(value: unknown): string {
 async function readJsonBody(
   request: IncomingMessage,
   bodyLimit: number,
+  timeoutMs: number,
 ): Promise<unknown> {
-  const chunks: Buffer[] = [];
-  let totalBytes = 0;
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    const timer = setTimeout(() => fail(new HttpError(
+      'Request body timed out.', 408, OpenAiErrorCode.Timeout,
+    )), timeoutMs);
 
-  for await (const part of request) {
-    const chunk = Buffer.from(part);
-    totalBytes += chunk.length;
+    const cleanup = () => {
+      clearTimeout(timer);
+      request.off('data', onData);
+      request.off('end', onEnd);
+      request.off('error', fail);
+      request.off('aborted', onAbort);
+    };
+    const fail = (error: Error) => {
+      cleanup();
+      request.pause();
+      reject(error);
+    };
+    const onAbort = () => fail(new HttpError(
+      'Client disconnected.', 499, OpenAiErrorCode.ClientClosedRequest,
+    ));
+    const onData = (part: Buffer) => {
+      totalBytes += part.length;
+      if (totalBytes > bodyLimit) {
+        fail(new HttpError(
+          'Request body too large.', 413, OpenAiErrorCode.RequestTooLarge,
+        ));
+        return;
+      }
+      chunks.push(part);
+    };
+    const onEnd = () => {
+      cleanup();
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString()));
+      } catch {
+        reject(invalidRequest('Body must be valid JSON.'));
+      }
+    };
 
-    if (totalBytes > bodyLimit) {
-      throw new HttpError(
-        'Request body too large.',
-        413,
-        OpenAiErrorCode.RequestTooLarge,
-      );
-    }
-    chunks.push(chunk);
-  }
-
-  try {
-    return JSON.parse(Buffer.concat(chunks).toString());
-  } catch {
-    throw invalidRequest('Body must be valid JSON.');
-  }
+    request.on('data', onData);
+    request.once('end', onEnd);
+    request.once('error', fail);
+    request.once('aborted', onAbort);
+  });
 }
 
 function hasValidBearerToken(

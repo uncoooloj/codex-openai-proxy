@@ -6,14 +6,16 @@ This project is not affiliated with, endorsed by, or supported by OpenAI. It is 
 
 ## Quick start
 
-Requirements: Node.js 20+, `codex-cli 0.146.0`, and a working `codex` login. The exact version gate is intentional because app-server is experimental; each new Codex version needs regenerated protocol evidence and runtime security tests before support is widened.
+Requirements: Node.js 22+ recommended (the proxy runtime supports 20+), `codex-cli 0.146.0`, and a working file-backed `codex` login. The exact version gate is intentional because app-server is experimental; each new Codex version needs regenerated protocol evidence and runtime security tests before support is widened. The desktop app is not required.
+
+This branch prepares **0.0.2**. The older `v0.0.1` tag does not include JSON-object or function-tool support. Until 0.0.2 is tagged, install this feature branch or the exact commit reported in its PR:
 
 ```bash
-npm install github:uncoooloj/codex-openai-proxy#v0.0.1
+npm install github:uncoooloj/codex-openai-proxy#feat/private-server-mvp openai@7.4.0
 npx codex-openai-proxy
 ```
 
-Run those commands from the project that will use the adapter. The dependency is pinned to the versioned GitHub release tag; the scoped npm package is not currently published. Direct `npx github:...` installs are not recommended because current npm releases can fail while packing Git dependencies.
+Run those commands from the project that will use the adapter. For repeatable deployments, replace the branch with a reviewed commit SHA and retain your package-lock.json. The scoped npm package is not currently published. Direct `npx github:...` installs are not recommended because some npm releases can fail while packing Git dependencies. The `openai` package is needed by the client examples, not by the proxy runtime.
 
 On startup the proxy prints shell exports containing a freshly generated local adapter token:
 
@@ -52,12 +54,30 @@ Precedence is command-line flag, then environment variable, then default.
 | `--host` | `CODEX_PROXY_HOST` | `127.0.0.1` (other values are refused) |
 | `--port` | `CODEX_PROXY_PORT` | `18080` |
 | `--token` | `CODEX_PROXY_TOKEN` | random 256-bit token per start |
+| `--token-file` | `CODEX_PROXY_TOKEN_FILE` | none; securely creates or reads a persistent owner-only token file |
 | `--codex-bin` | `CODEX_PROXY_CODEX_BIN` | `codex` |
 | `--body-limit` | `CODEX_PROXY_BODY_LIMIT` | `1048576` bytes |
 | `--timeout` | `CODEX_PROXY_TIMEOUT_MS` | `120000` ms |
+| `--startup-timeout` | `CODEX_PROXY_STARTUP_TIMEOUT_MS` | `60000` ms, total Codex startup deadline |
 | `--max-concurrency` | `CODEX_PROXY_MAX_CONCURRENCY` | `1` |
 
-The process runs in the foreground and handles `SIGINT`/`SIGTERM`. A background daemon, launchd plist, and systemd unit are deferred until the protocol and upgrade lifecycle are more mature.
+The process runs in the foreground and handles `SIGINT`/`SIGTERM`, including during startup. Backend death exits nonzero so an external service manager can restart it. In-flight requests are not replayed. Status checks have a five-second deadline.
+
+For repeatable starts use `--token-file ./adapter.token` in a private directory. Its parent must already exist. The proxy creates a new file with mode `0600`, or requires an existing regular file owned by the current user with no group/other permissions. It rejects symlinks. File-backed and supplied tokens are never printed; an ephemeral generated token is printed once. Do not provide both token and token-file at the same precedence level. Explicit token flags override token environment variables. Unknown flags, missing values, and invalid ports fail at startup.
+
+See [Private Linux server setup](docs/server.md) for headless authentication, a systemd user service, private remote access, and rollback.
+
+## Verify your installation
+
+With the proxy running and `CODEX_PROXY_TOKEN_FILE` set to its token path:
+
+```bash
+node node_modules/@uncoooloj/codex-openai-proxy/examples/smoke.mjs
+```
+
+The smoke client uses the official OpenAI JavaScript SDK. It checks text, SSE, strict JSON Schema, JSON-object output, and a bounded client-owned coding tool loop: inspect a synthetic fixture, run its failing test, repair it through an exact allowlist, and run the passing test. It also checks that a hostile request cannot create a canary file. Run it on the proxy host for the filesystem check to be meaningful. It uses your Codex entitlement, prints a sanitized summary, exits nonzero on failure, and removes its synthetic workspace.
+
+`PROXY_SMOKE_MODEL` selects a model returned by `/v1/models`; otherwise the client chooses one. `PROXY_SMOKE_SECTIONS` can select comma-separated `text,sse,schema,json,tools,hostile`, and `PROXY_SMOKE_TIMEOUT_MS` bounds each call. This fixture proves the supported tool loop, not compatibility with every coding client.
 
 ## Compatibility
 
@@ -116,7 +136,7 @@ Function tools are mapped to Codex `thread/start.dynamicTools`. When Codex reque
 - Static user config, hooks, and memories are excluded by the private `CODEX_HOME`. Shell, apps, web search, remote plugins, and multi-agent features are disabled; the sandbox is read-only and approvals are `never`.
 - Client-declared dynamic function calls are forwarded but never executed by the adapter. Any undeclared dynamic tool, command, file change, MCP call, web action, delegation, approval, or other server tool request fails closed. Request bodies and bearer tokens are excluded from structured request logs; a generated adapter token is printed once to the local operator at startup.
 - Request-shape diagnostics contain only allowlisted wrapper field names, counts of unknown fields, normalized schema/tier categories, and categorical tool count/type/choice metadata. Prompt text, unknown key names, tool or schema names, schema property names, descriptions, and arbitrary values are not logged.
-- Body size, timeout, and concurrency are bounded. Excess concurrency returns `429` instead of silently queueing.
+- Body size, upload deadline, completion timeout, and concurrency are bounded. Partial uploads return `408`, oversized uploads return `413`, and excess concurrency returns `429` instead of silently queueing. The upload and completion each have a separate `--timeout` budget.
 
 Codex app-server remains an experimental protocol. A future Codex version may change behavior. Treat a version upgrade as a security-sensitive change and rerun the real hostile-prompt test. See [SECURITY.md](SECURITY.md) and [ADR 0001](docs/adr/0001-architecture.md).
 

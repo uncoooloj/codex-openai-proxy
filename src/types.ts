@@ -72,6 +72,7 @@ export interface ProxyConfig {
   bodyLimit: number;
   timeoutMs: number;
   maxConcurrency: number;
+  startupTimeoutMs: number;
 }
 
 export interface ModelInfo {
@@ -102,6 +103,7 @@ export interface AppServerLike {
 }
 
 export interface AppServerOptions {
+  startupTimeoutMs?: number;
   codexBin?: string;
   cwd?: string;
   env?: NodeJS.ProcessEnv;

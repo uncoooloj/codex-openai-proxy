@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.0.2 - candidate
+
+- Add persistent owner-only token files and strict CLI configuration validation.
+- Bound asynchronous startup, status, cancellation, uploads, and shutdown; exit on backend death for service-manager recovery.
+- Keep configured bearer tokens and raw upstream startup errors out of service logs.
+- Apply one explicit native-feature deny policy at process and thread startup; remove adapter credentials from the Codex child environment.
+- Include a private Linux server guide, systemd user unit, and packaged OpenAI-client smoke with a client-owned coding tool loop.
+- Preserve JSON-object tool-call responses and final-only SSE content.
 
 - Accept strict Chat Completions `response_format.type="json_schema"` requests.
 - Pass the requested schema to Codex as the current turn's `outputSchema`.

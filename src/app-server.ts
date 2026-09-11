@@ -1,9 +1,10 @@
 import {
-  execFileSync,
   spawn,
+  type ChildProcess,
   type ChildProcessWithoutNullStreams,
 } from 'node:child_process';
 import { EventEmitter } from 'node:events';
+import { codexAppServerArguments, disabledFeatureConfiguration, removeAdapterEnvironment } from './safety-policy.js';
 import { rmSync } from 'node:fs';
 import { access, chmod, mkdtemp, rm, symlink } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
@@ -33,11 +34,12 @@ import type {
 
 const SUPPORTED_CODEX_VERSION = 'codex-cli 0.146.0';
 const REQUEST_TIMEOUT_MS = 15_000;
+const DEFAULT_STARTUP_TIMEOUT_MS = 60_000;
 const SHUTDOWN_GRACE_PERIOD_MS = 2_000;
 const TEMPORARY_CWD_PREFIX = 'codex-openai-proxy-';
 const TEMPORARY_HOME_PREFIX = 'codex-openai-proxy-home-';
 const SERVICE_NAME = 'codex-openai-proxy';
-const SERVICE_VERSION = '0.0.1';
+const SERVICE_VERSION = '0.0.2';
 
 const SAFE_TEXT_INSTRUCTIONS = [
   'Act only as a text-generation assistant.',
@@ -119,8 +121,6 @@ class StdioTransport implements JsonRpcTransport {
   private failure?: Error;
 
   constructor(bin: string, logger: Logger, env: NodeJS.ProcessEnv) {
-    assertSupportedCodexVersion(bin, env);
-
     this.child = spawn(bin, codexAppServerArguments(), {
       stdio: ['pipe', 'pipe', 'pipe'],
       env,
@@ -132,7 +132,7 @@ class StdioTransport implements JsonRpcTransport {
     );
     createInterface({ input: this.child.stderr }).on(
       'line',
-      (line) => logger.warn('codex_stderr', { message: redact(line) }),
+      () => logger.warn('codex_stderr', {}),
     );
 
     this.child.once('error', (error) => this.fail(error));
@@ -225,10 +225,14 @@ class StdioTransport implements JsonRpcTransport {
     this.child.stdin.end();
     this.child.kill('SIGTERM');
 
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
     const exitedGracefully = await Promise.race([
       closed.then(() => true),
-      wait(SHUTDOWN_GRACE_PERIOD_MS).then(() => false),
+      new Promise<boolean>((resolve) => {
+        graceTimer = setTimeout(() => resolve(false), SHUTDOWN_GRACE_PERIOD_MS);
+      }),
     ]);
+    if (graceTimer) clearTimeout(graceTimer);
 
     if (!exitedGracefully && this.child.exitCode === null) {
       this.child.kill('SIGKILL');
@@ -303,8 +307,15 @@ export class CodexAppServer implements AppServerLike {
   private models: ModelInfo[] = [];
   private readonly logger: Logger;
   private readonly policyEvents = new EventEmitter();
+  private readonly lifecycleEvents = new EventEmitter();
   private readonly toolCallCaptures = new Map<string, ToolCallCapture>();
+  private readonly interruptedTurns = new Set<string>();
+  private readonly interruptionTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
+  private interruptionPending = false;
   private readonly exitCleanup = () => this.cleanupSync();
+  private startupController?: AbortController;
+  private closePromise?: Promise<void>;
+  private closing = false;
 
   constructor(private readonly options: AppServerOptions = {}) {
     this.logger = options.logger ?? {
@@ -316,22 +327,46 @@ export class CodexAppServer implements AppServerLike {
 
   async initialize(): Promise<void> {
     if (this.initialized) return;
+    const controller = new AbortController();
+    this.startupController = controller;
+    const timeout = setTimeout(() => {
+      controller.abort(new Error('Codex startup timed out'));
+    }, this.options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS);
 
-    await this.prepareSafeWorkingDirectory();
-    this.transport = await this.createTransport();
-    this.registerToolRequestPolicy();
-    await this.initializeProtocol();
+    try {
+      await this.prepareSafeWorkingDirectory();
+      throwIfAborted(controller.signal);
+      this.transport = await this.createTransport(controller.signal);
+      this.registerToolRequestPolicy();
+      this.registerTransportFailureHandler();
+      await this.initializeProtocol(controller.signal);
 
-    this.models = await this.fetchModels();
-    if (this.models.length === 0) {
-      throw new Error('Codex returned no available models');
+      this.models = await this.fetchModels(controller.signal);
+      if (this.models.length === 0) {
+        throw new Error('Codex returned no available models');
+      }
+
+      this.initialized = true;
+    } catch (error) {
+      await this.close();
+      throw startupError(error);
+    } finally {
+      clearTimeout(timeout);
+      if (this.startupController === controller) {
+        this.startupController = undefined;
+      }
     }
+  }
 
-    this.initialized = true;
+  onFailure(handler: () => void): () => void {
+    this.lifecycleEvents.on('failure', handler);
+    return () => this.lifecycleEvents.off('failure', handler);
   }
 
   ready(): boolean {
-    return this.initialized && Boolean(this.transport?.alive());
+    return this.initialized
+      && !this.interruptionPending
+      && Boolean(this.transport?.alive());
   }
 
   async listModels(
@@ -368,7 +403,13 @@ export class CodexAppServer implements AppServerLike {
         handlers.signal,
       );
       const identity = { threadId: thread.id, turnId };
-      const interrupt = () => this.interruptTurn(identity);
+      const turnController = new AbortController();
+      const interrupt = () => {
+        if (!turnController.signal.aborted) {
+          turnController.abort(handlers.signal.reason ?? new Error('Turn cancelled'));
+        }
+        this.interruptTurn(identity);
+      };
 
       handlers.signal.addEventListener('abort', interrupt, { once: true });
       if (handlers.signal.aborted) interrupt();
@@ -379,6 +420,7 @@ export class CodexAppServer implements AppServerLike {
           handlers,
           interrupt,
           Boolean(capture),
+          turnController.signal,
         );
         if (!capture) {
           const text = await turn;
@@ -397,6 +439,7 @@ export class CodexAppServer implements AppServerLike {
         }
 
         interrupt();
+        await this.waitForInterruptedTurn(identity);
         void turn.catch(() => undefined);
         return {
           text: '',
@@ -405,7 +448,6 @@ export class CodexAppServer implements AppServerLike {
         };
       } finally {
         handlers.signal.removeEventListener('abort', interrupt);
-        if (handlers.signal.aborted) interrupt();
       }
     } finally {
       this.toolCallCaptures.delete(thread.id);
@@ -413,29 +455,29 @@ export class CodexAppServer implements AppServerLike {
   }
 
   async close(): Promise<void> {
-    this.initialized = false;
-    await this.transport?.close();
-
-    if (!this.options.cwd && this.safeCwd) {
-      await rm(this.safeCwd, { recursive: true, force: true });
-    }
-    if (this.isolatedCodexHome) {
-      await rm(this.isolatedCodexHome, { recursive: true, force: true });
-    }
-
-    process.off('exit', this.exitCleanup);
+    this.closing = true;
+    this.startupController?.abort(new Error('Codex startup cancelled'));
+    this.closePromise ??= this.closeResources();
+    await this.closePromise;
   }
 
   private async prepareSafeWorkingDirectory(): Promise<void> {
-    this.safeCwd = this.options.cwd
-      ?? await mkdtemp(join(tmpdir(), TEMPORARY_CWD_PREFIX));
-
-    if (!this.options.cwd) {
-      await chmod(this.safeCwd, 0o700);
+    if (this.options.cwd) {
+      this.safeCwd = this.options.cwd;
+      return;
     }
+
+    const safeCwd = await mkdtemp(join(tmpdir(), TEMPORARY_CWD_PREFIX));
+    if (this.closing) {
+      await rm(safeCwd, { recursive: true, force: true });
+      throw new Error('Codex startup cancelled');
+    }
+    this.safeCwd = safeCwd;
+
+    await chmod(this.safeCwd, 0o700);
   }
 
-  private async createTransport(): Promise<JsonRpcTransport> {
+  private async createTransport(signal: AbortSignal): Promise<JsonRpcTransport> {
     if (this.options.transport) return this.options.transport;
 
     const sourceCodexHome = this.options.env?.CODEX_HOME
@@ -443,25 +485,53 @@ export class CodexAppServer implements AppServerLike {
       ?? join(homedir(), '.codex');
     const sourceAuth = join(sourceCodexHome, 'auth.json');
 
+    throwIfAborted(signal);
     await access(sourceAuth).catch(() => {
       throw new Error(
         `Codex auth file not found at ${sourceAuth}; run codex login first.`,
       );
     });
 
-    this.isolatedCodexHome = await mkdtemp(
+    const isolatedCodexHome = await mkdtemp(
       join(tmpdir(), TEMPORARY_HOME_PREFIX),
     );
+    if (this.closing) {
+      await rm(isolatedCodexHome, { recursive: true, force: true });
+      throw new Error('Codex startup cancelled');
+    }
+    this.isolatedCodexHome = isolatedCodexHome;
     await chmod(this.isolatedCodexHome, 0o700);
     await symlink(sourceAuth, join(this.isolatedCodexHome, 'auth.json'));
+    throwIfAborted(signal);
     process.once('exit', this.exitCleanup);
 
     const env = this.createIsolatedEnvironment(this.isolatedCodexHome);
-    return new StdioTransport(
+    await assertSupportedCodexVersion(
       this.options.codexBin ?? 'codex',
-      this.logger,
       env,
+      signal,
     );
+    throwIfAborted(signal);
+    return new StdioTransport(this.options.codexBin ?? 'codex', this.logger, env);
+  }
+
+  private registerTransportFailureHandler(): void {
+    this.transport!.onNotification((message) => {
+      if (message.method === CodexNotification.TurnCompleted) {
+        const params = message.params as TurnEventParams | undefined;
+        const turnId = params?.turnId ?? params?.turn?.id;
+        if (params?.threadId && turnId) {
+          this.resolveInterruptedTurn(`${params.threadId}:${turnId}`);
+        }
+      }
+      if (
+        message.method === CodexNotification.TransportError
+        && !this.closing
+      ) {
+        this.initialized = false;
+        this.lifecycleEvents.emit('failure');
+      }
+    });
   }
 
   private createIsolatedEnvironment(codexHome: string): NodeJS.ProcessEnv {
@@ -473,8 +543,7 @@ export class CodexAppServer implements AppServerLike {
 
     // Prevent the child from recursively routing its own upstream traffic back
     // through this compatibility proxy.
-    delete env.OPENAI_BASE_URL;
-    delete env.OPENAI_API_BASE;
+    removeAdapterEnvironment(env);
     return env;
   }
 
@@ -533,8 +602,8 @@ export class CodexAppServer implements AppServerLike {
     });
   }
 
-  private async initializeProtocol(): Promise<void> {
-    await this.transport!.request(
+  private async initializeProtocol(signal: AbortSignal): Promise<void> {
+    await awaitWithAbort(this.transport!.request(
       CodexRpcMethod.Initialize,
       {
         clientInfo: {
@@ -547,19 +616,19 @@ export class CodexAppServer implements AppServerLike {
           requestAttestation: false,
         },
       },
-      AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    );
+      signal,
+    ), signal);
     this.transport!.notify(CodexRpcMethod.Initialized);
   }
 
   private async fetchModels(
     signal: AbortSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   ): Promise<ModelInfo[]> {
-    const result = await this.transport!.request(
+    const result = await awaitWithAbort(this.transport!.request(
       CodexRpcMethod.ListModels,
       { limit: 100, includeHidden: false },
       signal,
-    ) as { data?: Array<{ id: string; model?: string }> };
+    ), signal) as { data?: Array<{ id: string; model?: string }> };
 
     return (result.data ?? []).map((model) => ({
       id: model.model ?? model.id,
@@ -573,27 +642,33 @@ export class CodexAppServer implements AppServerLike {
     dynamicTools: ReturnType<typeof translateTools>,
     signal: AbortSignal,
   ): Promise<{ id: string; model?: string }> {
-    const result = await this.transport!.request(
-      CodexRpcMethod.StartThread,
-      {
-        model,
-        cwd: this.safeCwd,
-        approvalPolicy: 'never',
-        approvalsReviewer: 'user',
-        sandbox: 'read-only',
-        environments: [],
-        ephemeral: true,
-        baseInstructions: dynamicTools.length > 0
-          ? SAFE_TOOL_INSTRUCTIONS
-          : SAFE_TEXT_INSTRUCTIONS,
-        developerInstructions: developerInstructions || null,
-        dynamicTools,
-        serviceName: SERVICE_NAME,
-        threadSource: SERVICE_NAME,
-        config: disabledFeatureConfiguration(),
-      },
-      signal,
-    ) as { thread: { id: string }; model?: string };
+    let result: { thread: { id: string }; model?: string };
+    try {
+      result = await this.transport!.request(
+        CodexRpcMethod.StartThread,
+        {
+          model,
+          cwd: this.safeCwd,
+          approvalPolicy: 'never',
+          approvalsReviewer: 'user',
+          sandbox: 'read-only',
+          environments: [],
+          ephemeral: true,
+          baseInstructions: dynamicTools.length > 0
+            ? SAFE_TOOL_INSTRUCTIONS
+            : SAFE_TEXT_INSTRUCTIONS,
+          developerInstructions: developerInstructions || null,
+          dynamicTools,
+          serviceName: SERVICE_NAME,
+          threadSource: SERVICE_NAME,
+          config: disabledFeatureConfiguration(),
+        },
+        signal,
+      ) as { thread: { id: string }; model?: string };
+    } catch (error) {
+      if (signal.aborted) this.invalidateBackend();
+      throw error;
+    }
 
     return {
       id: result.thread.id,
@@ -608,17 +683,27 @@ export class CodexAppServer implements AppServerLike {
     serviceTier: string | undefined,
     signal: AbortSignal,
   ): Promise<string> {
-    const result = await this.transport!.request(
-      CodexRpcMethod.StartTurn,
-      {
-        threadId,
-        input: [{ type: 'text', text: prompt, text_elements: [] }],
-        environments: [],
-        ...(outputSchema ? { outputSchema } : {}),
-        ...(serviceTier ? { serviceTier } : {}),
-      },
-      signal,
-    ) as { turn: { id: string } };
+    let result: { turn: { id: string } };
+    try {
+      result = await this.transport!.request(
+        CodexRpcMethod.StartTurn,
+        {
+          threadId,
+          input: [{ type: 'text', text: prompt, text_elements: [] }],
+          environments: [],
+          ...(outputSchema ? { outputSchema } : {}),
+          ...(serviceTier ? { serviceTier } : {}),
+        },
+        signal,
+      ) as { turn: { id: string } };
+    } catch (error) {
+      if (signal.aborted) {
+        // A late turn/start response could leave an unaddressable turn running.
+        // End this private backend instead of reusing an uncertain session.
+        this.invalidateBackend();
+      }
+      throw error;
+    }
 
     return result.turn.id;
   }
@@ -628,6 +713,7 @@ export class CodexAppServer implements AppServerLike {
     handlers: CompletionHandlers,
     interrupt: () => void,
     allowDynamicToolCall: boolean,
+    signal: AbortSignal,
   ): Promise<string> {
     return new Promise((resolve, reject) => {
       let text = '';
@@ -636,6 +722,7 @@ export class CodexAppServer implements AppServerLike {
       const cleanup = () => {
         removeNotificationListener();
         this.policyEvents.off(PolicyEvent.Violation, onPolicyViolation);
+        signal.removeEventListener('abort', onAbort);
       };
 
       const fail = (error: Error) => {
@@ -645,8 +732,13 @@ export class CodexAppServer implements AppServerLike {
 
       const onPolicyViolation = (event?: Partial<TurnIdentity>) => {
         if (!policyViolationAppliesToTurn(event, identity)) return;
-        interrupt();
         fail(new Error('Codex attempted a disabled tool or approval request'));
+        interrupt();
+      };
+
+      const onAbort = () => {
+        interrupt();
+        fail(new Error('Codex turn interrupted'));
       };
 
       const onNotification = (message: JsonRpcMessage) => {
@@ -664,10 +756,10 @@ export class CodexAppServer implements AppServerLike {
           && !(allowDynamicToolCall
             && params?.item?.type === CodexItemType.DynamicToolCall)
         ) {
-          interrupt();
           fail(new Error(
             `Codex attempted disabled tool activity: ${params!.item!.type}`,
           ));
+          interrupt();
           return;
         }
 
@@ -704,14 +796,74 @@ export class CodexAppServer implements AppServerLike {
 
       removeNotificationListener = this.transport!.onNotification(onNotification);
       this.policyEvents.on(PolicyEvent.Violation, onPolicyViolation);
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) onAbort();
     });
   }
 
   private interruptTurn(identity: TurnIdentity): void {
-    void this.transport?.request(
+    const key = `${identity.threadId}:${identity.turnId}`;
+    if (this.interruptedTurns.has(key)) return;
+    this.interruptedTurns.add(key);
+    this.interruptionPending = true;
+    this.interruptionTimeouts.set(key, setTimeout(() => {
+      this.invalidateBackend();
+    }, SHUTDOWN_GRACE_PERIOD_MS));
+
+    const signal = AbortSignal.timeout(SHUTDOWN_GRACE_PERIOD_MS);
+    const request = this.transport?.request(
       CodexRpcMethod.InterruptTurn,
       identity,
-    ).catch(() => undefined);
+      signal,
+    );
+    if (!request) return;
+    void awaitWithAbort(request, signal).then(
+      () => undefined,
+      () => this.invalidateBackend(),
+    );
+  }
+
+  private resolveInterruptedTurn(key: string): void {
+    const timeout = this.interruptionTimeouts.get(key);
+    if (timeout) clearTimeout(timeout);
+    this.interruptionTimeouts.delete(key);
+    this.interruptedTurns.delete(key);
+    this.interruptionPending = this.interruptedTurns.size > 0;
+    this.lifecycleEvents.emit('interruption_resolved', key);
+  }
+
+  private waitForInterruptedTurn(identity: TurnIdentity): Promise<void> {
+    const key = `${identity.threadId}:${identity.turnId}`;
+    if (!this.interruptedTurns.has(key)) return Promise.resolve();
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error('Codex tool turn interruption was not confirmed'));
+      }, SHUTDOWN_GRACE_PERIOD_MS);
+      const onResolved = (resolvedKey: string) => {
+        if (resolvedKey !== key) return;
+        cleanup();
+        resolve();
+      };
+      const onFailure = () => {
+        cleanup();
+        reject(new Error('Codex backend stopped during tool interruption'));
+      };
+      const cleanup = () => {
+        clearTimeout(timeout);
+        this.lifecycleEvents.off('interruption_resolved', onResolved);
+        this.lifecycleEvents.off('failure', onFailure);
+      };
+      this.lifecycleEvents.on('interruption_resolved', onResolved);
+      this.lifecycleEvents.once('failure', onFailure);
+    });
+  }
+
+  private invalidateBackend(): void {
+    if (this.closing) return;
+    this.lifecycleEvents.emit('failure');
+    void this.close();
   }
 
   private assertReady(): void {
@@ -728,50 +880,123 @@ export class CodexAppServer implements AppServerLike {
       rmSync(this.isolatedCodexHome, { recursive: true, force: true });
     }
   }
-}
 
-function assertSupportedCodexVersion(
-  bin: string,
-  env: NodeJS.ProcessEnv,
-): void {
-  const version = execFileSync(bin, ['--version'], {
-    env,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'ignore'],
-    timeout: 10_000,
-  }).trim();
+  private async closeResources(): Promise<void> {
+    this.initialized = false;
+    for (const timeout of this.interruptionTimeouts.values()) clearTimeout(timeout);
+    this.interruptionTimeouts.clear();
+    this.interruptedTurns.clear();
+    this.interruptionPending = false;
+    await this.transport?.close();
 
-  if (version !== SUPPORTED_CODEX_VERSION) {
-    throw new Error(
-      `Unsupported Codex version: ${version}. `
-      + `This release requires ${SUPPORTED_CODEX_VERSION}.`,
-    );
+    if (!this.options.cwd && this.safeCwd) {
+      await rm(this.safeCwd, { recursive: true, force: true });
+    }
+    if (this.isolatedCodexHome) {
+      await rm(this.isolatedCodexHome, { recursive: true, force: true });
+    }
+
+    process.off('exit', this.exitCleanup);
   }
 }
 
-function codexAppServerArguments(): string[] {
-  return [
-    'app-server',
-    '-c', 'features.shell_tool=false',
-    '-c', 'features.apps=false',
-    '-c', 'features.multi_agent=false',
-    '-c', 'features.remote_plugin=false',
-    '-c', 'features.hooks=false',
-    '-c', 'features.goals=false',
-    '-c', 'web_search="disabled"',
-    '--listen', 'stdio://',
-  ];
+async function assertSupportedCodexVersion(
+  bin: string,
+  env: NodeJS.ProcessEnv,
+  signal: AbortSignal,
+): Promise<void> {
+  throwIfAborted(signal);
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(bin, ['--version'], {
+      env,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    let output = '';
+    let settled = false;
+    let cancellationError: Error | undefined;
+
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', abort);
+      if (error) reject(error);
+      else resolve();
+    };
+    const abort = () => {
+      cancellationError = new Error('Codex startup cancelled');
+      void stopChild(child).then(() => finish(cancellationError));
+    };
+
+    signal.addEventListener('abort', abort, { once: true });
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (output.length < 1_024) output += chunk.toString().slice(0, 1_024 - output.length);
+    });
+    child.once('error', () => finish(new Error('Unable to start Codex')));
+    child.once('close', (code) => {
+      if (code !== 0) {
+        finish(cancellationError ?? new Error('Unable to determine Codex version'));
+      } else if (output.trim() !== SUPPORTED_CODEX_VERSION) {
+        finish(new Error(
+          `Unsupported Codex version. This release requires ${SUPPORTED_CODEX_VERSION}.`,
+        ));
+      } else {
+        finish();
+      }
+    });
+  });
 }
 
-function disabledFeatureConfiguration(): Record<string, boolean | string> {
-  return {
-    'features.shell_tool': false,
-    'features.apps': false,
-    'features.multi_agent': false,
-    'features.remote_plugin': false,
-    'features.hooks': false,
-    web_search: 'disabled',
-  };
+async function stopChild(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null) return;
+  const closed = new Promise<void>((resolve) => child.once('close', () => resolve()));
+  child.kill('SIGTERM');
+  let graceTimer: ReturnType<typeof setTimeout> | undefined;
+  const exitedGracefully = await Promise.race([
+    closed.then(() => true),
+    new Promise<boolean>((resolve) => {
+      graceTimer = setTimeout(() => resolve(false), SHUTDOWN_GRACE_PERIOD_MS);
+    }),
+  ]);
+  if (graceTimer) clearTimeout(graceTimer);
+  if (!exitedGracefully && child.exitCode === null) {
+    child.kill('SIGKILL');
+    await closed;
+  }
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) {
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new Error('Codex startup cancelled');
+  }
+}
+
+function startupError(error: unknown): Error {
+  if (error instanceof Error) return error;
+  return new Error('Codex startup failed');
+}
+
+function awaitWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => {
+      cleanup();
+      reject(signal.reason);
+    };
+    const cleanup = () => signal.removeEventListener('abort', abort);
+    signal.addEventListener('abort', abort, { once: true });
+    operation.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
 }
 
 function translateConversation(request: ChatCompletionRequest): {
@@ -896,14 +1121,4 @@ function isBlockedToolItem(type: string | undefined): boolean {
 function isRpcResponse(message: JsonRpcMessage): boolean {
   return message.id !== undefined
     && (message.result !== undefined || message.error !== undefined);
-}
-
-function wait(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
-function redact(value: string): string {
-  return value
-    .replace(/(bearer\s+|api[_-]?key[=:\s]+)\S+/gi, '$1[redacted]')
-    .slice(0, 2_000);
 }

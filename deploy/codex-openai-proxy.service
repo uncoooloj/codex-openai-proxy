@@ -1,0 +1,20 @@
+[Unit]
+Description=Private Codex OpenAI compatibility proxy
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/codex-openai-proxy
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=CODEX_HOME=%h/.codex
+Environment=CODEX_PROXY_TOKEN_FILE=%h/.local/share/codex-openai-proxy/adapter.token
+ExecStart=/usr/bin/env node %h/.local/share/codex-openai-proxy/node_modules/@uncoooloj/codex-openai-proxy/dist/cli.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=default.target
