@@ -18,15 +18,19 @@ export enum CliFlag {
   Host = 'host',
   Port = 'port',
   Token = 'token',
+  TokenFile = 'token-file',
   CodexBin = 'codex-bin',
   BodyLimit = 'body-limit',
   Timeout = 'timeout',
+  StartupTimeout = 'startup-timeout',
   MaxConcurrency = 'max-concurrency',
 }
 
 export enum EnvironmentVariable {
   ProxyToken = 'CODEX_PROXY_TOKEN',
   LegacyProxyToken = 'CODEX_OPENAI_PROXY_TOKEN',
+  ProxyTokenFile = 'CODEX_PROXY_TOKEN_FILE',
+  LegacyProxyTokenFile = 'CODEX_OPENAI_PROXY_TOKEN_FILE',
   ProxyHost = 'CODEX_PROXY_HOST',
   LegacyProxyHost = 'CODEX_OPENAI_PROXY_HOST',
   ProxyPort = 'CODEX_PROXY_PORT',
@@ -37,6 +41,8 @@ export enum EnvironmentVariable {
   LegacyProxyBodyLimit = 'CODEX_OPENAI_PROXY_BODY_LIMIT',
   ProxyTimeout = 'CODEX_PROXY_TIMEOUT_MS',
   LegacyProxyTimeout = 'CODEX_OPENAI_PROXY_TIMEOUT_MS',
+  ProxyStartupTimeout = 'CODEX_PROXY_STARTUP_TIMEOUT_MS',
+  LegacyProxyStartupTimeout = 'CODEX_OPENAI_PROXY_STARTUP_TIMEOUT_MS',
   ProxyMaxConcurrency = 'CODEX_PROXY_MAX_CONCURRENCY',
   LegacyProxyMaxConcurrency = 'CODEX_OPENAI_PROXY_MAX_CONCURRENCY',
 }
