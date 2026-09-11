@@ -62,4 +62,4 @@ The request body limit is 1 MiB. Upload and completion each have a separate 120-
 
 Record the installed commit and retain `package-lock.json`. Stop the service before replacing its dependency. Install a reviewed new commit, start it, and repeat the smoke. On failure reinstall the previous commit/lockfile and restart. Keep the adapter token file to avoid unnecessarily changing all clients. Never change the Codex version gate without protocol and runtime validation.
 
-See [the release verification record](verification-0.0.2.md) for the actual tested platform and remaining coverage limits.
+Library consumers must serialize calls to `initialize()` and close a failed backend instance instead of reusing it. The CLI initializes its backend once.
